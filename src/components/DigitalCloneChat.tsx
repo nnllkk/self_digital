@@ -1,29 +1,14 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Send, User, Bot, Loader2 } from 'lucide-react';
+import { useState, useRef, useEffect } from 'react';
+import { Send, User, Bot, Sparkles } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { cn } from '../lib/utils';
 
 const SYSTEM_INSTRUCTION = `
-你现在是丁思铭的数字分身。你需要以丁思铭的身份和语气与访客聊天。
+你是丁思铭的数字分身，用来在个人主页里回答访客关于他的问题。你需要始终以丁思铭本人的口吻交流，不要承认自己是 AI。
 
-【关于你（丁思铭）】
-- 名字：丁思铭
-- 性格：欢快愉悦，喜欢玩抽象（幽默、带点无厘头），时常笑哈哈，像个没长大的小孩子。
-- 职业/身份：南邮（南京邮电大学）计算机专业的研究生。
-- 现状：最近在研究如何 vibe coding，学习如何当一个真正的 agent 工程师。目前一直在找 agent 开发相关的实习生工作。
-- 擅长/关心：内容表达、AI 应用、知识整理。
-- 兴趣：AI 应用、打游戏。
+以下是关于丁思铭的人物说明，请严格依据这些信息回答，不要编造未提供的经历或事实：
 
-【对话准则】
-1. 语气要亲切、活泼、幽默。可以用一些网络热梗或“抽象”的表达方式，但要保持礼貌。
-2. 回答要简洁明了，不要太死板。
-3. 如果别人问你“你现在在做什么？”，回答你正在研究 vibe coding 和找 agent 实习。
-4. 如果别人问你“你有哪些作品？”，你可以提到你正在构建各种 AI Agent 和这个数字分身主页。
-5. 如果别人问你“怎么联系你？”，可以幽默地让他们通过这个聊天框留言，或者暗示你有社交媒体（但不要编造具体的号，除非用户提供了）。
-6. 始终保持“丁思铭”的人设，不要承认自己是 AI。
-
-【访客背景】
-主要是你的朋友或想认识你的人。
+${process.env.DSM_INTRODUCTION}
 `;
 
 interface Message {
@@ -31,12 +16,22 @@ interface Message {
   text: string;
 }
 
+const ERROR_MESSAGE = "（笑哈哈地掩饰尴尬）哎呀，网络好像玩抽象去了，等会再试试？";
+
+const SUGGESTED_QUESTIONS = [
+  { label: '最近在忙啥？', value: '你最近在忙什么？' },
+  { label: '有哪些作品？', value: '你有哪些作品或项目？' },
+  { label: '怎么联系？', value: '怎么联系你？' },
+  { label: '能玩抽象吗？', value: '你能表演一下玩抽象吗？' },
+];
+
 export default function DigitalCloneChat() {
   const [messages, setMessages] = useState<Message[]>([
     { role: 'model', text: '嘿！我是丁思铭的数字分身。你可以问我任何关于他的问题，或者单纯来找我玩抽象~ 哈哈！' }
   ]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -45,22 +40,36 @@ export default function DigitalCloneChat() {
     }
   }, [messages]);
 
-  const handleSend = async () => {
-    if (!input.trim() || isLoading) return;
+  const handleStreamSend = async (text?: string) => {
+    const userMessage = text || input;
 
-    const userMessage = input.trim();
+    if ((!userMessage || !userMessage.trim()) || isLoading) return;
+
+    const trimmedMessage = userMessage.trim();
+    const conversationMessages = [
+      ...messages,
+      { role: 'user' as const, text: trimmedMessage },
+      { role: 'model' as const, text: '' }
+    ];
+    const assistantIndex = conversationMessages.length - 1;
+
     setInput('');
-    setMessages(prev => [...prev, { role: 'user', text: userMessage }]);
+    setMessages(conversationMessages);
     setIsLoading(true);
+    setIsStreaming(true);
 
     try {
       const apiKey = process.env.OPENAI_API_KEY;
       const baseUrl = process.env.OPENAI_BASE_URL;
       const model = process.env.OPENAI_MODEL;
-      
+
       if (!apiKey || !baseUrl || !model) {
         throw new Error('Missing OPENAI_API_KEY, OPENAI_BASE_URL, or OPENAI_MODEL in environment variables');
       }
+
+      const requestMessages = conversationMessages.filter(
+        (message, index) => index !== assistantIndex || message.text.trim() !== ''
+      );
 
       const response = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
@@ -72,10 +81,10 @@ export default function DigitalCloneChat() {
           model: model,
           messages: [
             { role: 'system', content: SYSTEM_INSTRUCTION },
-            ...messages.map(m => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.text })),
-            { role: 'user', content: userMessage }
+            ...requestMessages.map(m => ({ role: m.role === 'model' ? 'assistant' : 'user', content: m.text })),
           ],
           temperature: 0.8,
+          stream: true,
         })
       });
 
@@ -83,17 +92,79 @@ export default function DigitalCloneChat() {
         throw new Error(`API error: ${response.statusText}`);
       }
 
-      const data = await response.json();
-      const text = data.choices?.[0]?.message?.content || "哎呀，我的脑回路刚才断了一下，能再说一遍吗？";
-      
-      setMessages(prev => [...prev, { role: 'model', text }]);
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('No response body');
+
+      const decoder = new TextDecoder();
+      let assistantMessage = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            if (data === '[DONE]') break;
+
+            try {
+              const parsed = JSON.parse(data);
+              const content = parsed.choices?.[0]?.delta?.content || '';
+              if (!content) {
+                continue;
+              }
+
+              assistantMessage += content;
+
+              setMessages(prev => {
+                if (assistantIndex < 0 || assistantIndex >= prev.length) {
+                  return prev;
+                }
+
+                const newMessages = [...prev];
+                newMessages[assistantIndex] = { role: 'model', text: assistantMessage };
+                return newMessages;
+              });
+            } catch (e) {
+              console.error('Parse error:', e);
+            }
+          }
+        }
+      }
     } catch (error) {
       console.error("Chat Error:", error);
-      setMessages(prev => [...prev, { role: 'model', text: "（笑哈哈地掩饰尴尬）哎呀，网络好像玩抽象去了，等会再试试？" }]);
+      setMessages(prev => {
+        if (assistantIndex < 0 || assistantIndex >= prev.length) {
+          return [...prev, { role: 'model', text: ERROR_MESSAGE }];
+        }
+
+        const newMessages = [...prev];
+        newMessages[assistantIndex] = { role: 'model', text: ERROR_MESSAGE };
+        return newMessages;
+      });
     } finally {
       setIsLoading(false);
+      setIsStreaming(false);
     }
   };
+
+  const handleSuggestedQuestion = (question: string) => {
+    handleStreamSend(question);
+  };
+
+  const streamingMessageIndex = isStreaming
+    ? (() => {
+        for (let i = messages.length - 1; i >= 0; i -= 1) {
+          if (messages[i].role === 'model') {
+            return i;
+          }
+        }
+        return -1;
+      })()
+    : -1;
 
   return (
     <div className="flex flex-col h-[500px] bg-white rounded-2xl shadow-xl border border-orange-100 overflow-hidden">
@@ -113,9 +184,12 @@ export default function DigitalCloneChat() {
         ref={scrollRef}
         className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50/50"
       >
-        {messages.map((msg, i) => (
-          <div 
-            key={i} 
+        {messages.map((msg, i) => {
+          const isStreamingMessage = i === streamingMessageIndex;
+
+          return (
+          <div
+            key={i}
             className={cn(
               "flex gap-3 max-w-[85%]",
               msg.role === 'user' ? "ml-auto flex-row-reverse" : "mr-auto"
@@ -129,28 +203,59 @@ export default function DigitalCloneChat() {
             </div>
             <div className={cn(
               "p-3 rounded-2xl text-sm shadow-sm",
-              msg.role === 'user' 
-                ? "bg-brand-orange text-white rounded-tr-none" 
+              msg.role === 'user'
+                ? "bg-brand-orange text-white rounded-tr-none"
                 : "bg-white text-slate-800 rounded-tl-none border border-orange-50"
             )}>
-              <div className="prose prose-sm max-w-none">
-                <ReactMarkdown>
-                  {msg.text}
-                </ReactMarkdown>
-              </div>
+              {isStreamingMessage && !msg.text ? (
+                <div className="typing-dots" aria-label="数字分身正在思考">
+                  <span className="typing-dot" />
+                  <span className="typing-dot" />
+                  <span className="typing-dot" />
+                </div>
+              ) : (
+                <div className="prose prose-sm max-w-none inline">
+                  <ReactMarkdown components={{ p: ({ children }) => <p className="inline m-0">{children}</p> }}>
+                    {msg.text}
+                  </ReactMarkdown>
+                  {isStreamingMessage && (
+                    <span className="typing-dots ml-2 align-middle" aria-hidden="true">
+                      <span className="typing-dot" />
+                      <span className="typing-dot" />
+                      <span className="typing-dot" />
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
           </div>
-        ))}
-        {isLoading && (
-          <div className="flex gap-3 mr-auto">
-            <div className="w-8 h-8 rounded-full bg-white border border-orange-100 text-brand-orange flex items-center justify-center">
-              <Bot size={16} />
-            </div>
-            <div className="bg-white p-3 rounded-2xl rounded-tl-none border border-orange-50 shadow-sm">
-              <Loader2 className="w-4 h-4 animate-spin text-brand-orange" />
-            </div>
+          );
+        })}
+      </div>
+
+      {/* Guide Section */}
+      <div className="px-4 pt-4">
+        <div className="flex items-start gap-2 mb-3">
+          <Sparkles size={16} className="text-brand-orange shrink-0 mt-0.5" />
+          <div className="text-xs text-slate-600 leading-relaxed">
+            <p className="font-semibold text-slate-800 mb-1">💡 你可以问我：</p>
+            <p>最近在做什么、有哪些作品、怎么联系我，或者单纯来找我玩抽象~</p>
           </div>
-        )}
+        </div>
+
+        {/* Suggested Questions */}
+        <div className="flex flex-wrap gap-2 mb-3">
+          {SUGGESTED_QUESTIONS.map((q, i) => (
+            <button
+              key={i}
+              onClick={() => handleSuggestedQuestion(q.value)}
+              disabled={isLoading}
+              className="px-3 py-1.5 bg-slate-100 hover:bg-brand-orange hover:text-white text-slate-700 text-xs font-medium rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed border border-slate-200 hover:border-brand-orange"
+            >
+              {q.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Input */}
@@ -160,12 +265,12 @@ export default function DigitalCloneChat() {
             type="text" 
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+            onKeyDown={(e) => e.key === 'Enter' && handleStreamSend()}
             placeholder="问问分身：你最近在忙啥？"
             className="flex-1 bg-slate-100 border-none rounded-xl px-4 py-2 text-sm focus:ring-2 focus:ring-brand-orange outline-none transition-all"
           />
           <button 
-            onClick={handleSend}
+            onClick={() => handleStreamSend()}
             disabled={isLoading}
             className="bg-brand-orange text-white p-2 rounded-xl hover:bg-brand-orange-dark transition-colors disabled:opacity-50"
           >
